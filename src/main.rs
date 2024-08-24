@@ -181,17 +181,21 @@ where
 #[derive(Debug)]
 enum ApiObjectParts {
     Root,
-    Organization(String),
-    Project(String, String),
-    Issue(String, String, String),
-    Event(String, String, String, String),
+    Organization,
+    Project(String),
+    Issue(String, String),
+    Event(String, String, String),
 }
 
 #[derive(Debug)]
 struct SentryFSInfo {
+    parent: u64,
+    name: String,
     parts: ApiObjectParts,
     kind: FileType,
-    children: Option<HashMap<String, (u64, FileType)>>,
+    size: u64,
+    //name -> (inode, type, size)
+    children: Option<HashMap<String, (u64, FileType, u64)>>,
     data: Option<Bytes>,
 }
 
@@ -208,8 +212,11 @@ impl SentryFS {
         inode_map.insert(
             FUSE_ROOT_ID,
             SentryFSInfo {
+                parent: 0,
+                name: "/".to_string(),
                 parts: ApiObjectParts::Root,
                 kind: FileType::Directory,
+                size: 0,
                 children: None,
                 data: None,
             },
@@ -233,7 +240,7 @@ impl Filesystem for SentryFS {
             }
         };
         if info.children.is_none() {
-            match &self.inode_map.get(&ino).unwrap().parts {
+            match &info.parts {
                 ApiObjectParts::Root => {
                     self.runtime.block_on(async {
                         let mut org_stream = ApiList::<Organization>::new(
@@ -246,23 +253,27 @@ impl Filesystem for SentryFS {
                             self.last_used_inode += 1;
                             children.insert(
                                 org.slug.clone(),
-                                (self.last_used_inode, FileType::Directory),
+                                (self.last_used_inode, FileType::Directory, 0),
                             );
                             self.inode_map.insert(
                                 self.last_used_inode,
                                 SentryFSInfo {
-                                    parts: ApiObjectParts::Organization(org.slug),
+                                    parent: ino,
+                                    name: org.slug,
+                                    parts: ApiObjectParts::Organization,
                                     kind: FileType::Directory,
+                                    size: 0,
                                     children: None,
                                     data: None,
                                 },
                             );
                         }
+                        self.inode_map.get_mut(&ino).unwrap().size = children.len() as u64;
                         self.inode_map.get_mut(&ino).unwrap().children = Some(children);
                     });
                 }
-                ApiObjectParts::Organization(org) => {
-                    let org = org.clone();
+                ApiObjectParts::Organization => {
+                    let org = info.name.clone();
                     self.runtime.block_on(async {
                         let mut proj_stream = ApiList::<Project>::new(
                             &self.client,
@@ -274,24 +285,38 @@ impl Filesystem for SentryFS {
                             self.last_used_inode += 1;
                             children.insert(
                                 proj.slug.clone(),
-                                (self.last_used_inode, FileType::Directory),
+                                (self.last_used_inode, FileType::Directory, 0),
                             );
                             self.inode_map.insert(
                                 self.last_used_inode,
                                 SentryFSInfo {
-                                    parts: ApiObjectParts::Project(org.clone(), proj.slug),
+                                    parent: ino,
+                                    name: proj.slug,
+                                    parts: ApiObjectParts::Project(org.clone()),
                                     kind: FileType::Directory,
+                                    size: 0,
                                     children: None,
                                     data: None,
                                 },
                             );
                         }
+                        self.inode_map.get_mut(&ino).unwrap().size = children.len() as u64;
+                        let parent_ino = self.inode_map.get(&ino).unwrap().parent;
+                        self.inode_map
+                            .get_mut(&parent_ino)
+                            .unwrap()
+                            .children
+                            .as_mut()
+                            .unwrap()
+                            .get_mut(&org)
+                            .unwrap()
+                            .2 = children.len() as u64;
                         self.inode_map.get_mut(&ino).unwrap().children = Some(children);
                     });
                 }
-                ApiObjectParts::Project(org, proj) => {
+                ApiObjectParts::Project(org) => {
                     let org = org.clone();
-                    let proj = proj.clone();
+                    let proj = info.name.clone();
                     self.runtime.block_on(async {
                         let mut issue_stream = ApiList::<Issue>::new(
                             &self.client,
@@ -303,29 +328,39 @@ impl Filesystem for SentryFS {
                             self.last_used_inode += 1;
                             children.insert(
                                 issue.id.clone(),
-                                (self.last_used_inode, FileType::Directory),
+                                (self.last_used_inode, FileType::Directory, 0),
                             );
                             self.inode_map.insert(
                                 self.last_used_inode,
                                 SentryFSInfo {
-                                    parts: ApiObjectParts::Issue(
-                                        org.clone(),
-                                        proj.clone(),
-                                        issue.id,
-                                    ),
+                                    parent: ino,
+                                    name: issue.id,
+                                    parts: ApiObjectParts::Issue(org.clone(), proj.clone()),
                                     kind: FileType::Directory,
+                                    size: 0,
                                     children: None,
                                     data: None,
                                 },
                             );
                         }
+                        self.inode_map.get_mut(&ino).unwrap().size = children.len() as u64;
+                        let parent_ino = self.inode_map.get(&ino).unwrap().parent;
+                        self.inode_map
+                            .get_mut(&parent_ino)
+                            .unwrap()
+                            .children
+                            .as_mut()
+                            .unwrap()
+                            .get_mut(&proj)
+                            .unwrap()
+                            .2 = children.len() as u64;
                         self.inode_map.get_mut(&ino).unwrap().children = Some(children);
                     });
                 }
-                ApiObjectParts::Issue(org, proj, issue) => {
+                ApiObjectParts::Issue(org, proj) => {
                     let org = org.clone();
                     let proj = proj.clone();
-                    let issue = issue.clone();
+                    let issue = info.name.clone();
                     self.runtime.block_on(async {
                         let mut event_stream = ApiList::<Event>::new(
                             &self.client,
@@ -340,27 +375,40 @@ impl Filesystem for SentryFS {
                             self.last_used_inode += 1;
                             children.insert(
                                 event.id.clone(),
-                                (self.last_used_inode, FileType::RegularFile),
+                                (self.last_used_inode, FileType::RegularFile, 0),
                             );
                             self.inode_map.insert(
                                 self.last_used_inode,
                                 SentryFSInfo {
+                                    parent: ino,
+                                    name: event.id,
                                     parts: ApiObjectParts::Event(
                                         org.clone(),
                                         proj.clone(),
                                         issue.clone(),
-                                        event.id,
                                     ),
                                     kind: FileType::RegularFile,
+                                    size: 0,
                                     children: None,
                                     data: None,
                                 },
                             );
                         }
+                        self.inode_map.get_mut(&ino).unwrap().size = children.len() as u64;
+                        let parent_ino = self.inode_map.get(&ino).unwrap().parent;
+                        self.inode_map
+                            .get_mut(&parent_ino)
+                            .unwrap()
+                            .children
+                            .as_mut()
+                            .unwrap()
+                            .get_mut(&issue)
+                            .unwrap()
+                            .2 = children.len() as u64;
                         self.inode_map.get_mut(&ino).unwrap().children = Some(children);
                     });
                 }
-                ApiObjectParts::Event(_org, _proj, _issue, _event) => {
+                ApiObjectParts::Event(_org, _proj, _issue) => {
                     reply.error(ENOTDIR);
                     return;
                 }
@@ -381,7 +429,7 @@ impl Filesystem for SentryFS {
             reply.error(ENOENT);
             return;
         }
-        let (ino, kind) = match parent_info
+        let (ino, kind, size) = match parent_info
             .children
             .as_ref()
             .unwrap()
@@ -393,18 +441,6 @@ impl Filesystem for SentryFS {
                 reply.error(ENOENT);
                 return;
             }
-        };
-        let info = match self.inode_map.get(&ino) {
-            Some(x) => x,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        let size = match info.kind {
-            FileType::Directory => info.children.as_ref().map_or(0, |v| v.len() as u64),
-            FileType::RegularFile => info.data.as_ref().map_or(0, |v| v.len() as u64),
-            _ => panic!(),
         };
         reply.entry(
             &TTL,
@@ -437,16 +473,11 @@ impl Filesystem for SentryFS {
                 return;
             }
         };
-        let size = match info.kind {
-            FileType::Directory => info.children.as_ref().map_or(0, |v| v.len() as u64),
-            FileType::RegularFile => info.data.as_ref().map_or(0, |v| v.len() as u64),
-            _ => panic!(),
-        };
         reply.attr(
             &TTL,
             &FileAttr {
                 ino,
-                size,
+                size: info.size,
                 blocks: 0,
                 atime: UNIX_EPOCH, // 1970-01-01 00:00:00
                 mtime: UNIX_EPOCH,
@@ -510,12 +541,12 @@ impl Filesystem for SentryFS {
             FileType::RegularFile => {
                 if info.data.is_none() {
                     self.runtime.block_on(async {
-                        if let ApiObjectParts::Event(org, proj, _issue, event) = &info.parts {
+                        if let ApiObjectParts::Event(org, proj, _issue) = &info.parts {
                             info.data = Some(
                                 self.client
                                     .get(format!(
                                         "https://sentry.io/api/0/projects/{}/{}/events/{}/",
-                                        org, proj, event
+                                        org, proj, info.name
                                     ))
                                     .send()
                                     .await
@@ -529,6 +560,18 @@ impl Filesystem for SentryFS {
                         }
                     });
                 }
+                info.size = info.data.as_mut().unwrap().len() as u64;
+                let parent_ino = info.parent;
+                let name = info.name.clone();
+                self.inode_map
+                    .get_mut(&parent_ino)
+                    .unwrap()
+                    .children
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(&name)
+                    .unwrap()
+                    .2 = info.data.as_mut().unwrap().len() as u64;
                 reply.opened(0, 0);
             }
             _ => panic!(),
