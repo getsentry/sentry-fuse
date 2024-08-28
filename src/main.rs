@@ -13,11 +13,13 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     ReplyOpen, Request, FUSE_ROOT_ID,
 };
+use futures::future;
+use futures::stream::StreamExt;
 use reqwest::{header, Client, ClientBuilder, Response};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tokio::runtime::{Builder, Runtime};
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::Stream;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -241,6 +243,7 @@ impl Filesystem for SentryFS {
         };
         if info.children.is_none() {
             match &info.parts {
+                // move things out of the async block.
                 ApiObjectParts::Root => {
                     self.runtime.block_on(async {
                         let mut org_stream = ApiList::<Organization>::new(
@@ -362,50 +365,72 @@ impl Filesystem for SentryFS {
                     let proj = proj.clone();
                     let issue = info.name.clone();
                     self.runtime.block_on(async {
-                        let mut event_stream = ApiList::<Event>::new(
+                        let child_names: Vec<_> = ApiList::<Event>::new(
                             &self.client,
                             format!(
                                 "https://sentry.io/api/0/organizations/{}/issues/{}/events/",
                                 org, issue
                             ),
                         )
+                        .await
+                        .collect()
                         .await;
-                        let mut children = HashMap::new();
-                        while let Some(event) = event_stream.next().await {
-                            self.last_used_inode += 1;
-                            children.insert(
-                                event.id.clone(),
-                                (self.last_used_inode, FileType::RegularFile, 0),
-                            );
-                            self.inode_map.insert(
-                                self.last_used_inode,
-                                SentryFSInfo {
-                                    parent: ino,
-                                    name: event.id,
-                                    parts: ApiObjectParts::Event(
-                                        org.clone(),
-                                        proj.clone(),
-                                        issue.clone(),
-                                    ),
-                                    kind: FileType::RegularFile,
-                                    size: 0,
-                                    children: None,
-                                    data: None,
-                                },
-                            );
-                        }
-                        self.inode_map.get_mut(&ino).unwrap().size = children.len() as u64;
-                        let parent_ino = self.inode_map.get(&ino).unwrap().parent;
-                        self.inode_map
-                            .get_mut(&parent_ino)
-                            .unwrap()
-                            .children
-                            .as_mut()
-                            .unwrap()
-                            .get_mut(&issue)
-                            .unwrap()
-                            .2 = children.len() as u64;
-                        self.inode_map.get_mut(&ino).unwrap().children = Some(children);
+                        let bodies = tokio_stream::iter(child_names)
+                            .map(|event| {
+                                let org = &org;
+                                let proj = &proj;
+                                let client = &self.client;
+                                async move {
+                                    println!("getting {}", event.id);
+                                    (
+                                        event.id.clone(),
+                                        client
+                                            .get(format!(
+                                                "https://sentry.io/api/0/projects/{}/{}/events/{}/",
+                                                org, proj, event.id
+                                            ))
+                                            .send()
+                                            .await
+                                            .unwrap()
+                                            .bytes()
+                                            .await,
+                                    )
+                                }
+                            })
+                            .buffer_unordered(15); // concurrent requests
+                        let mut children: HashMap<String, (u64, FileType, u64)> = HashMap::new(); // could collect into this.
+                        bodies
+                            .for_each(|(name, b)| {
+                                println!("adding {}", name);
+                                let body = b.unwrap();
+                                self.last_used_inode += 1;
+                                let size = body.len() as u64;
+                                children.insert(
+                                    name.clone(),
+                                    (self.last_used_inode, FileType::RegularFile, size),
+                                );
+                                self.inode_map.insert(
+                                    self.last_used_inode,
+                                    SentryFSInfo {
+                                        parent: ino,
+                                        name,
+                                        parts: ApiObjectParts::Event(
+                                            org.clone(),
+                                            proj.clone(),
+                                            issue.clone(),
+                                        ),
+                                        kind: FileType::RegularFile,
+                                        size,
+                                        children: None,
+                                        data: Some(body),
+                                    },
+                                );
+                                future::ready(())
+                            })
+                            .await;
+                        let issue = self.inode_map.get_mut(&ino).unwrap();
+                        issue.size = children.len() as u64;
+                        issue.children = Some(children);
                     });
                 }
                 ApiObjectParts::Event(_org, _proj, _issue) => {
@@ -540,38 +565,8 @@ impl Filesystem for SentryFS {
             }
             FileType::RegularFile => {
                 if info.data.is_none() {
-                    self.runtime.block_on(async {
-                        if let ApiObjectParts::Event(org, proj, _issue) = &info.parts {
-                            info.data = Some(
-                                self.client
-                                    .get(format!(
-                                        "https://sentry.io/api/0/projects/{}/{}/events/{}/",
-                                        org, proj, info.name
-                                    ))
-                                    .send()
-                                    .await
-                                    .unwrap()
-                                    .bytes()
-                                    .await
-                                    .unwrap(),
-                            );
-                        } else {
-                            panic!();
-                        }
-                    });
+                    panic!();
                 }
-                info.size = info.data.as_mut().unwrap().len() as u64;
-                let parent_ino = info.parent;
-                let name = info.name.clone();
-                self.inode_map
-                    .get_mut(&parent_ino)
-                    .unwrap()
-                    .children
-                    .as_mut()
-                    .unwrap()
-                    .get_mut(&name)
-                    .unwrap()
-                    .2 = info.data.as_mut().unwrap().len() as u64;
                 reply.opened(0, 0);
             }
             _ => panic!(),
