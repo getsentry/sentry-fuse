@@ -377,10 +377,10 @@ impl Filesystem for SentryFS {
                         .await;
                         let bodies = tokio_stream::iter(child_names)
                             .map(|event| {
-                                let org = &org;
-                                let proj = &proj;
-                                let client = &self.client;
-                                async move {
+                                let org = org.clone();
+                                let proj = proj.clone();
+                                let client = self.client.clone();
+                                tokio::spawn(async move {
                                     println!("getting {}", event.id);
                                     (
                                         event.id.clone(),
@@ -395,12 +395,13 @@ impl Filesystem for SentryFS {
                                             .bytes()
                                             .await,
                                     )
-                                }
+                                })
                             })
                             .buffer_unordered(15); // concurrent requests
                         let mut children: HashMap<String, (u64, FileType, u64)> = HashMap::new(); // could collect into this.
                         bodies
-                            .for_each(|(name, b)| {
+                            .for_each(|result| {
+                                let (name, b) = result.unwrap();
                                 println!("adding {}", name);
                                 let body = b.unwrap();
                                 self.last_used_inode += 1;
